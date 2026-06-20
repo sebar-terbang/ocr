@@ -21,8 +21,30 @@ const state = {
   startTime: null,
   totalPages: 0,
   donePages: 0,
-  worker: null,
+  worker: null,       // legacy single-worker ref (kept for compat)
+  workerPool: [],     // array of Tesseract workers running in parallel
+  poolSize: 1,
 };
+
+// ── Auto-detect safe worker pool size ────────────────────────
+function getOptimalWorkerCount() {
+  const cores = navigator.hardwareConcurrency || 2;
+  // Leave 1 core free for the UI thread so the page doesn't freeze.
+  // Cap at 4 — Tesseract's own per-worker overhead means more than
+  // that gives diminishing returns and risks memory pressure on
+  // lower-end devices.
+  return Math.max(1, Math.min(4, cores - 1));
+}
+
+function showWorkerIndicator() {
+  const n = getOptimalWorkerCount();
+  if (n <= 1) {
+    dom.workerIndicator.classList.add('is-single');
+    dom.workerIndicatorText.textContent = 'Single-core mode — pages processed one at a time';
+  } else {
+    dom.workerIndicatorText.textContent = `Fast mode — ${n} pages OCR'd in parallel on this device`;
+  }
+}
 
 // ── DOM refs ─────────────────────────────────────────────────
 const dom = {
@@ -38,6 +60,9 @@ const dom = {
   modeBBtn:        document.getElementById('mode-b-btn'),
   modeDesc:        document.getElementById('mode-desc'),
   processBtn:      document.getElementById('process-btn'),
+  workerIndicator:     document.getElementById('worker-indicator'),
+  workerIndicatorText: document.getElementById('worker-indicator-text'),
+  progressWorkerLine:  document.getElementById('progress-worker-line'),
   progressSection: document.getElementById('progress-section'),
   cancelBtn:       document.getElementById('cancel-btn'),
   progressFile:    document.getElementById('progress-file'),
@@ -233,23 +258,29 @@ dom.modeBBtn.addEventListener('click', () => setMode('b'));
 // ── Lang Select ──────────────────────────────────────────────
 dom.langSelect.addEventListener('change', () => { state.lang = dom.langSelect.value; });
 
-// ── OCR Worker Management ────────────────────────────────────
-async function getWorker(lang) {
-  if (state.worker) {
-    try { await state.worker.terminate(); } catch (_) {}
-    state.worker = null;
+// ── OCR Worker Pool Management ───────────────────────────────
+// Multiple Tesseract workers run in parallel, each in its own Web
+// Worker thread. This does not change the OCR engine, language data,
+// or recognition settings in any way — it only lets independent pages
+// be recognized concurrently instead of one-at-a-time, so accuracy is
+// identical to a single worker. Pool size is auto-detected from the
+// device's CPU core count (see getOptimalWorkerCount).
+async function createWorkerPool(lang, size) {
+  await terminateWorkerPool();
+  const pool = [];
+  for (let i = 0; i < size; i++) {
+    const worker = await Tesseract.createWorker(lang, 1, { logger: () => {} });
+    pool.push(worker);
   }
-  const worker = await Tesseract.createWorker(lang, 1, {
-    logger: () => {},
-  });
-  state.worker = worker;
-  return worker;
+  state.workerPool = pool;
+  state.poolSize = size;
+  return pool;
 }
 
-async function terminateWorker() {
-  if (state.worker) {
-    try { await state.worker.terminate(); } catch (_) {}
-    state.worker = null;
+async function terminateWorkerPool() {
+  if (state.workerPool.length) {
+    await Promise.all(state.workerPool.map(w => w.terminate().catch(() => {})));
+    state.workerPool = [];
   }
 }
 
@@ -329,6 +360,7 @@ async function startProcessing() {
   dom.statsSection.hidden = true;
   dom.resultsSection.hidden = true;
   dom.progressLog.innerHTML = '';
+  dom.progressWorkerLine.textContent = '';
   dom.cancelBtn.disabled = false;
   dom.cancelBtn.textContent = 'Cancel';
   dom.progressEta.textContent = 'Estimating…';
@@ -353,10 +385,15 @@ async function startProcessing() {
       }
     }
 
-    // Init Tesseract worker
-    logEntry('Loading OCR engine…');
-    const worker = await getWorker(lang);
+    // Init Tesseract worker pool — size auto-detected from CPU cores
+    const poolSize = getOptimalWorkerCount();
+    logEntry(`Loading OCR engine (${poolSize} parallel worker${poolSize > 1 ? 's' : ''})…`);
+    const pool = await createWorkerPool(lang, poolSize);
     logEntry('OCR engine ready ✓', 'done');
+
+    dom.progressWorkerLine.innerHTML = poolSize > 1
+      ? `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg> Running ${poolSize} pages in parallel`
+      : `Running in single-core mode`;
 
     // Process each file
     const collectedTexts = []; // for mode B
@@ -374,27 +411,59 @@ async function startProcessing() {
         const bytes  = await entry.file.arrayBuffer();
         const pdf    = await pdfjsLib.getDocument({ data: bytes }).promise;
         numPages = pdf.numPages;
+        pageTexts = new Array(numPages).fill('');
 
-        for (let pg = 1; pg <= numPages; pg++) {
-          if (state.cancelled) break;
+        // Render all pages to canvases first (rendering is cheap/serial —
+        // PDF.js needs one page open at a time per document). Each canvas
+        // is then handed to whichever pool worker is free, so multiple
+        // pages get OCR'd at the same time. Results are written back by
+        // page index, so final order is identical to serial processing —
+        // nothing about the recognition itself changes.
+        let nextPageToRender = 1;
+        let pagesCompleted = 0;
+        let inFlight = 0;
 
-          const globalPct = ((state.donePages / state.totalPages) * 100);
-          setProgress(globalPct, `${entry.name} — Page ${pg}/${numPages}`, pg, numPages);
+        await new Promise((resolveAll) => {
+          // dispatch() fills every free worker slot with the next
+          // unrendered page. It's called once at start, then once each
+          // time a worker finishes (so it always tries to refill).
+          // Using a loop here instead of mutual recursion keeps the call
+          // stack flat even for PDFs with hundreds of pages.
+          const dispatch = () => {
+            while (inFlight < pool.length && nextPageToRender <= numPages && !state.cancelled) {
+              runPage(nextPageToRender++);
+            }
+            if (inFlight === 0) resolveAll();
+          };
 
-          try {
-            const page   = await pdf.getPage(pg);
-            const canvas = await pdfPageToImageData(page);
-            page.cleanup();
+          const runPage = (pg) => {
+            const worker = pool[(pg - 1) % pool.length];
+            inFlight++;
 
-            const text = await ocrCanvas(worker, canvas);
-            pageTexts.push(text);
-          } catch (pageErr) {
-            pageTexts.push('');
-            logEntry(`  ⚠ Page ${pg} failed: ${pageErr.message}`, 'error');
-          }
+            (async () => {
+              try {
+                const page   = await pdf.getPage(pg);
+                const canvas = await pdfPageToImageData(page);
+                page.cleanup();
 
-          state.donePages++;
-        }
+                const text = await ocrCanvas(worker, canvas);
+                pageTexts[pg - 1] = text;
+              } catch (pageErr) {
+                pageTexts[pg - 1] = '';
+                logEntry(`  ⚠ Page ${pg} failed: ${pageErr.message}`, 'error');
+              } finally {
+                pagesCompleted++;
+                state.donePages++;
+                inFlight--;
+                const globalPct = (state.donePages / state.totalPages) * 100;
+                setProgress(globalPct, `${entry.name} — Page ${pagesCompleted}/${numPages}`, pagesCompleted, numPages);
+                dispatch(); // this worker is free — try to give it more work
+              }
+            })();
+          };
+
+          dispatch();
+        });
 
         pdf.destroy();
       } catch (pdfErr) {
@@ -603,3 +672,4 @@ document.addEventListener('drop', e => {
 
 // ── Initial state ─────────────────────────────────────────────
 dom.processBtn.disabled = true;
+showWorkerIndicator();

@@ -146,6 +146,11 @@
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>
               Start OCR
             </button>
+
+            <p class="worker-indicator" id="worker-indicator" title="Number of pages processed simultaneously, auto-detected from your device's CPU cores">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg>
+              <span id="worker-indicator-text">Detecting device speed…</span>
+            </p>
           </section>
 
         </div>
@@ -162,6 +167,8 @@
               </h2>
               <button id="cancel-btn" class="btn-ghost btn-sm btn-danger" aria-label="Cancel processing">Cancel</button>
             </div>
+
+            <p class="progress-worker-line" id="progress-worker-line"></p>
 
             <div class="progress-info">
               <div class="progress-status">

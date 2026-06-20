@@ -504,6 +504,29 @@ ul { list-style: none; }
   color: var(--clr-accent-2);
 }
 
+/* ── Worker Indicator ── */
+.worker-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: center;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--clr-text-3);
+}
+.worker-indicator svg { flex-shrink: 0; color: var(--clr-accent-2); }
+.worker-indicator.is-single svg { color: var(--clr-text-3); }
+
+.progress-worker-line {
+  font-size: 11px;
+  color: var(--clr-accent-2);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.progress-worker-line:empty { display: none; }
+
 /* ── Progress ── */
 .progress-info { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
 .progress-status { display: flex; align-items: center; justify-content: space-between; }
